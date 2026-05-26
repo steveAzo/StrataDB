@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"stratadb/bloom"
@@ -24,33 +26,115 @@ var ErrNotFound = errors.New("key not found")
 // Read path:   memtable → L0 (newest→oldest) → L1
 type DB struct {
 	mu      sync.RWMutex
-	dir     string                      // directory holding all SSTable and WAL files
+	dir     string
 	mem     *memtable.Memtable
 	w       *wal.WAL
-	levels  [][]string                  // levels[0]=L0 paths, levels[1]=L1 paths
-	filters map[string]*bloom.Filter    // SSTable path → bloom filter
-	maxL0   int                         // compact L0 into L1 when len(levels[0]) >= maxL0
-	seq     int                         // counter for unique SSTable filenames
+	levels  [][]string               // levels[0]=L0 paths, levels[1]=L1 paths
+	filters map[string]*bloom.Filter // SSTable path → bloom filter
+	maxL0   int
+	maxMem  int // stored so we can recreate the memtable after flush
+	seq     int // counter for unique SSTable filenames
 }
 
-// Open opens or creates a DB in dir. Creates the directory if needed.
-// maxMemBytes is the memtable flush threshold; maxL0Files triggers L0 compaction.
+// Open opens or creates a DB in dir, recovering state from any existing
+// SSTable files and replaying the WAL to restore in-flight writes.
 func Open(dir string, maxMemBytes, maxL0Files int) (*DB, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	w, err := wal.Open(filepath.Join(dir, "wal"))
+
+	db := &DB{
+		dir:     dir,
+		mem:     memtable.New(maxMemBytes),
+		levels:  [][]string{{}, {}},
+		filters: make(map[string]*bloom.Filter),
+		maxL0:   maxL0Files,
+		maxMem:  maxMemBytes,
+	}
+
+	// Recover SSTable files from the previous run.
+	if err := db.loadExisting(); err != nil {
+		return nil, err
+	}
+
+	// Replay WAL to recover any writes that were in the memtable when the
+	// process last stopped. Must happen after loadExisting so the sequence
+	// counter is already set past all on-disk file numbers.
+	walPath := filepath.Join(dir, "wal")
+	if _, err := os.Stat(walPath); err == nil {
+		entries, err := wal.Replay(walPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.Deleted {
+				db.mem.Delete(e.Key)
+			} else {
+				db.mem.Put(e.Key, e.Value)
+			}
+		}
+	}
+
+	w, err := wal.Open(walPath)
 	if err != nil {
 		return nil, err
 	}
-	return &DB{
-		dir:     dir,
-		mem:     memtable.New(maxMemBytes),
-		w:       w,
-		levels:  [][]string{{}, {}}, // L0 and L1 start empty
-		filters: make(map[string]*bloom.Filter),
-		maxL0:   maxL0Files,
-	}, nil
+	db.w = w
+	return db, nil
+}
+
+// loadExisting scans dir for SSTable files from a previous run, populates
+// db.levels and db.filters, and sets db.seq to the highest seen file number.
+//
+// Filenames look like "L0-00001.sst" or "L1-00003.sst".
+// os.ReadDir returns entries alphabetically, which is also ascending numeric
+// order for zero-padded names — so levels[0] is already oldest→newest.
+func (db *DB) loadExisting() error {
+	dirEntries, err := os.ReadDir(db.dir)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range dirEntries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".sst") {
+			continue
+		}
+
+		var levelIdx int 
+		if strings.HasPrefix(name, "L0-") {
+			levelIdx = 0
+		} else if strings.HasPrefix(name, "L1-") {
+			levelIdx = 1
+		} else {
+			continue
+		}
+
+		seqStr := strings.TrimSuffix(name[3:], ".sst")
+		seq, err := strconv.Atoi(seqStr)
+		if err != nil {
+			continue
+		}
+		if seq > db.seq {
+			db.seq = seq
+		}
+		//
+		// Add path to the right level and rebuild its bloom filter:
+		path := filepath.Join(db.dir, name)
+		db.levels[levelIdx] = append(db.levels[levelIdx], path)
+		entries, err := sstable.ReadAll(path)
+		if err != nil {
+			return err
+		}
+		f := bloom.New(uint64(len(entries)+1) * 10)
+		for _, e := range entries {
+			f.Add(e.Key)
+		}
+		db.filters[path] = f
+
+		_ = name
+	}
+	return nil
 }
 
 // Close flushes the memtable to disk and closes the WAL.
@@ -108,7 +192,11 @@ func (db *DB) Get(key string) (string, error) {
 	}
 
 	for i := len(db.levels[0]) - 1; i >= 0; i-- {
-		if e, err := sstable.Get(db.levels[0][i], key); err == nil {
+		path := db.levels[0][i]
+		if f, ok := db.filters[path]; ok && !f.MayContain(key) {
+			continue
+		}
+		if e, err := sstable.Get(path, key); err == nil {
 			if e.Deleted {
 				return "", ErrNotFound
 			}
@@ -117,14 +205,16 @@ func (db *DB) Get(key string) (string, error) {
 	}
 
 	for _, path := range db.levels[1] {
+		if f, ok := db.filters[path]; ok && !f.MayContain(key) {
+			continue
+		}
 		if e, err := sstable.Get(path, key); err == nil {
 			if e.Deleted {
-				return  "", ErrNotFound
+				return "", ErrNotFound
 			}
 			return e.Value, nil
 		}
 	}
-
 
 	return "", ErrNotFound
 }
@@ -141,15 +231,14 @@ func (db *DB) flush() error {
 	if err := sstable.Write(path, entries); err != nil {
 		return err
 	}
-	// build a bloom filter for the new SSTable so Get can skip it cheaply
-	f := bloom.New(uint64(len(entries)) * 10)
+	f := bloom.New(uint64(len(entries)+1) * 10)
 	for _, e := range entries {
 		f.Add(e.Key)
 	}
 	db.filters[path] = f
 
 	db.levels[0] = append(db.levels[0], path)
-	db.mem = memtable.New(db.mem.Size()) // reset; reuse same threshold
+	db.mem = memtable.New(db.maxMem)
 
 	if len(db.levels[0]) >= db.maxL0 {
 		return db.compactL0()
@@ -167,11 +256,22 @@ func (db *DB) compactL0() error {
 	if err := compaction.Merge(db.levels[0], outPath); err != nil {
 		return err
 	}
-	// clean up the L0 files that were merged away
 	for _, p := range db.levels[0] {
 		os.Remove(p)
+		delete(db.filters, p)
 	}
 	db.levels[0] = nil
+
+	// rebuild bloom filter for the new merged L1 file
+	entries, err := sstable.ReadAll(outPath)
+	if err != nil {
+		return err
+	}
+	f := bloom.New(uint64(len(entries)+1) * 10)
+	for _, e := range entries {
+		f.Add(e.Key)
+	}
+	db.filters[outPath] = f
 	db.levels[1] = append(db.levels[1], outPath)
 	return nil
 }
