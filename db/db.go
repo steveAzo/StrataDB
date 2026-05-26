@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"stratadb/bloom"
 	"stratadb/compaction"
 	"stratadb/memtable"
 	"stratadb/sstable"
@@ -22,13 +23,14 @@ var ErrNotFound = errors.New("key not found")
 // Write path:  WAL → memtable → flush to L0 → compact L0 into L1
 // Read path:   memtable → L0 (newest→oldest) → L1
 type DB struct {
-	mu     sync.RWMutex
-	dir    string               // directory holding all SSTable and WAL files
-	mem    *memtable.Memtable
-	w      *wal.WAL
-	levels [][]string           // levels[0]=L0 paths, levels[1]=L1 paths
-	maxL0  int                  // compact L0 into L1 when len(levels[0]) >= maxL0
-	seq    int                  // counter for unique SSTable filenames
+	mu      sync.RWMutex
+	dir     string                      // directory holding all SSTable and WAL files
+	mem     *memtable.Memtable
+	w       *wal.WAL
+	levels  [][]string                  // levels[0]=L0 paths, levels[1]=L1 paths
+	filters map[string]*bloom.Filter    // SSTable path → bloom filter
+	maxL0   int                         // compact L0 into L1 when len(levels[0]) >= maxL0
+	seq     int                         // counter for unique SSTable filenames
 }
 
 // Open opens or creates a DB in dir. Creates the directory if needed.
@@ -42,11 +44,12 @@ func Open(dir string, maxMemBytes, maxL0Files int) (*DB, error) {
 		return nil, err
 	}
 	return &DB{
-		dir:    dir,
-		mem:    memtable.New(maxMemBytes),
-		w:      w,
-		levels: [][]string{{}, {}}, // L0 and L1 start empty
-		maxL0:  maxL0Files,
+		dir:     dir,
+		mem:     memtable.New(maxMemBytes),
+		w:       w,
+		levels:  [][]string{{}, {}}, // L0 and L1 start empty
+		filters: make(map[string]*bloom.Filter),
+		maxL0:   maxL0Files,
 	}, nil
 }
 
@@ -134,9 +137,17 @@ func (db *DB) flush() error {
 		return nil
 	}
 	path := db.nextPath("L0")
-	if err := sstable.Write(path, db.mem.Entries()); err != nil {
+	entries := db.mem.Entries()
+	if err := sstable.Write(path, entries); err != nil {
 		return err
 	}
+	// build a bloom filter for the new SSTable so Get can skip it cheaply
+	f := bloom.New(uint64(len(entries)) * 10)
+	for _, e := range entries {
+		f.Add(e.Key)
+	}
+	db.filters[path] = f
+
 	db.levels[0] = append(db.levels[0], path)
 	db.mem = memtable.New(db.mem.Size()) // reset; reuse same threshold
 
