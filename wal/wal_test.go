@@ -54,8 +54,10 @@ func TestDeleteRemovesFile(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	if _, err := Open(path); err != nil {
+	w2, err := Open(path)
+	if err != nil {
 		// file was deleted — opening it should create a new one, not error
 		t.Fatalf("expected Open to recreate WAL, got: %v", err)
 	}
+	w2.Close()
 }

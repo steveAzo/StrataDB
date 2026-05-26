@@ -25,13 +25,11 @@ type WAL struct {
 // Open opens an existing WAL file or creates a new one at path.
 // Appends go to the end of the file (os.O_APPEND).
 func Open(path string) (*WAL, error) {
-	// TODO: open the file with os.O_CREATE|os.O_RDWR|os.O_APPEND and return a &WAL{f: f}
-	// f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// return &WAL{f: f}, nil
-	return nil, nil
+	f, err := os.OpenFile(path, os.O_CREATE |os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &WAL{f: f}, nil
 }
 
 // Append writes one entry to the WAL and fsyncs immediately.
@@ -42,6 +40,9 @@ func (w *WAL) Append(e memtable.Entry) error {
 	// 	return err
 	// }
 	// return w.f.Sync()
+	if err := writeRecord(w.f, e); err != nil {
+		return err
+	}
 	return nil
 }
 
