@@ -8,23 +8,19 @@ import (
 	"stratadb/memtable"
 )
 
-// Record layout on disk (one per entry, written sequentially):
+// File layout:
 //
-//	[key_len   uint32 - 4 bytes]
-//	[key       bytes  - key_len bytes]
-//	[value_len uint32 - 4 bytes]
-//	[value     bytes  - value_len bytes]
-//	[deleted   uint8  - 1 byte]  0 = live, 1 = tombstone
+//	[data section  ] one record per entry, length-prefix framing
+//	[index section ] one (key, offset) pair per entry — keys only, no values
+//	[footer        ] 8-byte indexOffset + 4-byte numEntries = 12 bytes total
 //
-// Entries are written in sorted key order (the memtable guarantees this
-// via Entries()). The file is never modified after creation.
-//
-// Why length-prefix framing? Same reason as LogStream: no delimiters to
-// scan for, no escaping needed. Each record is fully self-describing.
+// The index lets Get seek directly to a record without reading the whole file.
+// indexOffset is the byte position where the index section starts.
 
-// Write flushes a sorted slice of memtable entries to a new SSTable file
-// at the given path. The file is fsynced before returning so the data
-// survives a crash. Returns an error if any write fails.
+const footerSize = 12 // uint64 + uint32
+
+// Write flushes a sorted slice of memtable entries to a new SSTable at path.
+// It writes the data section, then the index, then the footer, then fsyncs.
 func Write(path string, entries []memtable.Entry) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -32,32 +28,52 @@ func Write(path string, entries []memtable.Entry) error {
 	}
 	defer f.Close()
 
-	for _, e := range entries {
+	offsets := make([]uint64, len(entries))
+	for i, e := range entries {
+		off, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		offsets[i] = uint64(off)
 		if err := writeRecord(f, e); err != nil {
 			return err
 		}
 	}
+	
+	indexOffset, _ := f.Seek(0, io.SeekCurrent)
+	for i, e := range entries {
+		if err := writeIndexEntry(f, e.Key, offsets[i]); err != nil {
+			return err
+		}
+	}
+	
+	binary.Write(f, binary.BigEndian, uint64(indexOffset))
+	binary.Write(f, binary.BigEndian, uint32(len(entries)))
 
-	// fsync so the OS flushes its write buffer to disk.
-	// Without this, a crash after Write returns could leave an empty file.
+	_ = io.SeekCurrent
+	_ = entries
 	return f.Sync()
 }
 
-// writeRecord encodes one Entry into the length-prefix binary format and
-// writes it to w. Uses binary.Write with big-endian byte order.
+// writeRecord encodes one Entry into length-prefix binary format.
 func writeRecord(w io.Writer, e memtable.Entry) error {
 	keyBytes := []byte(e.Key)
 	valBytes := []byte(e.Value)
-
 	binary.Write(w, binary.BigEndian, uint32(len(keyBytes)))
 	w.Write(keyBytes)
 	binary.Write(w, binary.BigEndian, uint32(len(valBytes)))
 	w.Write(valBytes)
 	return binary.Write(w, binary.BigEndian, boolToByte(e.Deleted))
-
 }
 
-// boolToByte converts a bool to 0 or 1 for on-disk storage.
+// writeIndexEntry writes one index record: key length, key bytes, byte offset.
+func writeIndexEntry(w io.Writer, key string, offset uint64) error {
+	keyBytes := []byte(key)
+	binary.Write(w, binary.BigEndian, uint32(len(keyBytes)))
+	w.Write(keyBytes)
+	return binary.Write(w, binary.BigEndian, offset)
+}
+
 func boolToByte(b bool) byte {
 	if b {
 		return 1

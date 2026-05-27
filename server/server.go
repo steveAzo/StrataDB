@@ -68,7 +68,6 @@ func (s *Server) handleGet(w http.ResponseWriter, _ *http.Request, key string) {
 		return
 	}
 	w.Write([]byte(val))
-	_ = errors.Is
 }
 
 // handlePut reads the request body as the value and stores key→value.
@@ -83,7 +82,6 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	_ = io.ReadAll
 }
 
 // handleDelete removes a key.

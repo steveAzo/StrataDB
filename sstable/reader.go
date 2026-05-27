@@ -13,9 +13,50 @@ import (
 // ErrNotFound is returned by Get when the key does not exist in this SSTable.
 var ErrNotFound = errors.New("key not found")
 
-// ReadAll reads every record from the SSTable file at path and returns
-// them as a slice. Records are already in sorted key order (the writer
-// guarantees this), so the returned slice is sorted too.
+// footer holds the two values packed into the last 12 bytes of every SSTable.
+type footer struct {
+	indexOffset uint64 // byte position where the index section starts
+	numEntries  uint32 // number of index (and data) entries
+}
+
+// indexEntry is one record from the index section: a key and the byte offset
+// of its corresponding data record in the data section.
+type indexEntry struct {
+	Key    string
+	Offset uint64
+}
+
+// readFooter reads the 12-byte footer from the end of f.
+func readFooter(f *os.File) (footer, error) {
+	if _, err := f.Seek(-footerSize, io.SeekEnd); err != nil {
+		return footer{}, err
+	}
+	var ft footer
+	binary.Read(f, binary.BigEndian, &ft.indexOffset)
+	binary.Read(f, binary.BigEndian, &ft.numEntries)
+	return ft, nil
+}
+
+// readIndex seeks to the index section and reads all (key, offset) pairs.
+func readIndex(f *os.File, ft footer) ([]indexEntry, error) {
+	if _, err := f.Seek(int64(ft.indexOffset), io.SeekStart); err != nil {
+		return nil, err
+	}
+	entries := make([]indexEntry, ft.numEntries)
+	for i := range entries {
+		var keyLen uint32
+		binary.Read(f, binary.BigEndian, &keyLen)
+		keyBytes := make([]byte, keyLen)
+		io.ReadFull(f, keyBytes)
+		var offset uint64
+		binary.Read(f, binary.BigEndian, &offset)
+		entries[i] = indexEntry{Key: string(keyBytes), Offset: offset}
+	}
+	return entries, nil
+}
+
+// ReadAll reads every data record from the SSTable at path.
+// It reads only up to indexOffset so it never tries to decode index bytes as records.
 func ReadAll(path string) ([]memtable.Entry, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -23,8 +64,20 @@ func ReadAll(path string) ([]memtable.Entry, error) {
 	}
 	defer f.Close()
 
+	ft, err := readFooter(f)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
 	var entries []memtable.Entry
 	for {
+		pos, _ := f.Seek(0, io.SeekCurrent)
+		if uint64(pos) >= ft.indexOffset {
+			break
+		}
 		e, err := readRecord(f)
 		if errors.Is(err, io.EOF) {
 			break
@@ -37,82 +90,60 @@ func ReadAll(path string) ([]memtable.Entry, error) {
 	return entries, nil
 }
 
-// readRecord decodes one Entry from r using the same length-prefix format
-// the writer used. Returns io.EOF when there are no more records.
+// Get looks up key in the SSTable using the index — no full file scan.
+// It reads the footer, loads the index, binary searches for the key,
+// then seeks directly to the matching data record.
+func Get(path, key string) (memtable.Entry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return memtable.Entry{}, err
+	}
+	defer f.Close()
+
+	// TODO: read footer, read index, binary search for key, seek to record offset, return readRecord(f)
+	//
+	ft, err := readFooter(f)
+	if err != nil {
+		return memtable.Entry{}, err
+	}
+	index, err := readIndex(f, ft)
+	if err != nil {
+		return memtable.Entry{}, err
+	}
+	i := sort.Search(len(index), func(i int) bool { return index[i].Key >= key })
+	if i >= len(index) || index[i].Key != key {
+		return memtable.Entry{}, ErrNotFound
+	}
+	if _, err := f.Seek(int64(index[i].Offset), io.SeekStart); err != nil {
+		return memtable.Entry{}, err
+	}
+	return readRecord(f)
+
+	// _ = sort.Search
+	// return memtable.Entry{}, ErrNotFound
+}
+
+// readRecord decodes one Entry from r using length-prefix framing.
+// Returns io.EOF when there are no more records.
 func readRecord(r io.Reader) (memtable.Entry, error) {
-	// TODO: mirror writeRecord exactly, but read instead of write
-	// Read key length, then key bytes, then value length, then value bytes, then deleted flag.
-	//
-	// var keyLen uint32
-	// if err := binary.Read(r, binary.BigEndian, &keyLen); err != nil {
-	// 	return memtable.Entry{}, err  // io.EOF here means clean end-of-file
-	// }
-	// keyBytes := make([]byte, keyLen)
-	// io.ReadFull(r, keyBytes)
-	//
-	// var valLen uint32
-	// binary.Read(r, binary.BigEndian, &valLen)
-	// valBytes := make([]byte, valLen)
-	// io.ReadFull(r, valBytes)
-	//
-	// var deleted uint8
-	// binary.Read(r, binary.BigEndian, &deleted)
-	//
-	// return memtable.Entry{
-	// 	Key:     string(keyBytes),
-	// 	Value:   string(valBytes),
-	// 	Deleted: deleted == 1,
-	// }, nil
-	var keyLen uint32 
+	var keyLen uint32
 	if err := binary.Read(r, binary.BigEndian, &keyLen); err != nil {
 		return memtable.Entry{}, err
 	}
 	keyBytes := make([]byte, keyLen)
 	io.ReadFull(r, keyBytes)
 
-	var valLen uint32 
+	var valLen uint32
 	binary.Read(r, binary.BigEndian, &valLen)
 	valBytes := make([]byte, valLen)
 	io.ReadFull(r, valBytes)
 
-	var deleted uint8 
+	var deleted uint8
 	binary.Read(r, binary.BigEndian, &deleted)
 
 	return memtable.Entry{
-		Key: string(keyBytes),
-		Value: string(valBytes),
+		Key:     string(keyBytes),
+		Value:   string(valBytes),
 		Deleted: deleted == 1,
-	}, nil 
-
-
-}
-
-// Get searches the SSTable for the given key.
-// Returns ErrNotFound if the key is absent or was tombstoned.
-func Get(path, key string) (memtable.Entry, error) {
-	entries, err := ReadAll(path)
-	if err != nil {
-		return memtable.Entry{}, err
-	}
-
-	// TODO: binary search entries for key using sort.Search, return ErrNotFound if missing
-	// sort.Search returns the smallest index i where entries[i].Key >= key.
-	// If that index is in bounds and entries[i].Key == key, you found it.
-	//
-	// i := sort.Search(len(entries), func(i int) bool {
-	// 	return entries[i].Key >= key
-	// })
-	// if i < len(entries) && entries[i].Key == key {
-	// 	return entries[i], nil
-	// }
-	// return memtable.Entry{}, ErrNotFound
-	i := sort.Search(len(entries), func(i int) bool {
-		return entries[i].Key >= key
-	})
-	if i < len(entries) && entries[i].Key == key {
-		return entries[i], nil 
-	}
-
-	_ = sort.Search
-	return memtable.Entry{}, ErrNotFound
+	}, nil
 }
